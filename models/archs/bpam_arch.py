@@ -58,27 +58,64 @@ class Slicing_CUDA(nn.Module):
 class Slicing(nn.Module):
     def __init__(self):
         super().__init__()
-                
-    def forward(self, grid, guide):
-        gb, c, gh, gw = guide.shape    
+        self.register_buffer('_base_x', torch.empty(0), persistent=False)
+        self.register_buffer('_base_y', torch.empty(0), persistent=False)
+        self._base_hw = None
 
-        pos = torch.tensor([[0,gh,0,gw]]).repeat(gb,1).to(guide.device)
-        xxx, yyy = [], []     
-        for b in range(gb):   
-            pos_h, size_h, pos_w, size_w = pos[b]  
-            x = (torch.arange(gw).to(guide) + pos_w - size_w / 2) / (size_w / 2) 
-            y = (torch.arange(gh).to(guide) + pos_h - size_h / 2) / (size_h / 2)
-            yy, xx = torch.meshgrid(y, x)  
-            xx = xx.unsqueeze(0).unsqueeze(0)  
-            yy = yy.unsqueeze(0).unsqueeze(0)  
-            xxx.append(xx)  
-            yyy.append(yy)
-        xxx = torch.cat(xxx, dim=0)  
-        yyy = torch.cat(yyy, dim=0)
-        
-        return nn.functional.grid_sample(grid,
-                                         torch.stack((xxx, yyy, guide), dim=-1),      
-                                         padding_mode='border').squeeze(2)
+    def _get_base_grid(self, guide):
+        _, _, gh, gw = guide.shape
+        needs_update = (
+            self._base_x.numel() == 0
+            or self._base_x.device != guide.device
+            or self._base_x.dtype != guide.dtype
+            or self._base_hw != (gh, gw)
+        )
+
+        if needs_update:
+            x = (torch.arange(gw, device=guide.device, dtype=guide.dtype) - gw / 2) / (gw / 2)
+            y = (torch.arange(gh, device=guide.device, dtype=guide.dtype) - gh / 2) / (gh / 2)
+            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            self._base_x = xx.unsqueeze(0).unsqueeze(0)
+            self._base_y = yy.unsqueeze(0).unsqueeze(0)
+            self._base_hw = (gh, gw)
+
+        return self._base_x, self._base_y
+
+    def forward(self, grid, guide):
+        batch_size, guide_groups, gh, gw = guide.shape
+        grid_channels = grid.shape[1]
+
+        if grid_channels % guide_groups != 0:
+            raise ValueError(
+                f'Grid channels ({grid_channels}) must be divisible by guide groups ({guide_groups}).'
+            )
+
+        channels_per_group = grid_channels // guide_groups
+        depth, grid_h, grid_w = grid.shape[2:]
+
+        base_x, base_y = self._get_base_grid(guide)
+        batch_groups = batch_size * guide_groups
+
+        sampling_grid = torch.stack(
+            (
+                base_x.expand(batch_groups, -1, -1, -1),
+                base_y.expand(batch_groups, -1, -1, -1),
+                guide.reshape(batch_groups, 1, gh, gw)
+            ),
+            dim=-1
+        )
+
+        grid = grid.reshape(batch_size, guide_groups, channels_per_group, depth, grid_h, grid_w)
+        grid = grid.reshape(batch_groups, channels_per_group, depth, grid_h, grid_w)
+
+        out = F.grid_sample(
+            grid.contiguous(),
+            sampling_grid,
+            padding_mode='border',
+            align_corners=False
+        ).squeeze(2)
+
+        return out.reshape(batch_size, grid_channels, gh, gw)
     
           
 class apply_coeff(nn.Module):
@@ -108,12 +145,7 @@ class MLP(nn.Module):
     def forward(self, src, grid1, grid2):
 
         context_map = self.context1(src)
-        
-        coeff_map_r = self.slicing(grid1[:, 0:8, :, :, :], context_map[:, 0:1, :, :])
-        coeff_map_g = self.slicing(grid1[:, 8:16, :, :, :], context_map[:, 1:2, :, :])
-        coeff_map_b = self.slicing(grid1[:, 16:24, :, :, :], context_map[:, 2:3, :, :])
-        coeff_map_c = self.slicing(grid1[:, 24:32, :, :, :], context_map[:, 3:4, :, :])
-        coeff1 = torch.cat([coeff_map_r, coeff_map_g, coeff_map_b, coeff_map_c], dim = 1)
+        coeff1 = self.slicing(grid1, context_map)
         
         coeff1_split = coeff1.view(coeff1.shape[0], 4, 8, coeff1.shape[2], coeff1.shape[3]).permute(0, 2, 1, 3, 4)
 
@@ -121,18 +153,7 @@ class MLP(nn.Module):
         hidden = self.activation(hidden)
         
         context_map2 = self.context2(hidden)
-        
-        coeff_map_1 = self.slicing(grid2[:, 0:3, :, :, :], context_map2[:, 0:1, :, :])
-        coeff_map_2 = self.slicing(grid2[:, 3:6, :, :, :], context_map2[:, 1:2, :, :])
-        coeff_map_3 = self.slicing(grid2[:, 6:9, :, :, :], context_map2[:, 2:3, :, :])
-        coeff_map_4 = self.slicing(grid2[:, 9:12, :, :, :], context_map2[:, 3:4, :, :])
-        coeff_map_5 = self.slicing(grid2[:, 12:15, :, :, :], context_map2[:, 4:5, :, :])
-        coeff_map_6 = self.slicing(grid2[:, 15:18, :, :, :], context_map2[:, 5:6, :, :])
-        coeff_map_7 = self.slicing(grid2[:, 18:21, :, :, :], context_map2[:, 6:7, :, :])
-        coeff_map_8 = self.slicing(grid2[:, 21:24, :, :, :], context_map2[:, 7:8, :, :])
-        coeff_map_9 = self.slicing(grid2[:, 24:27, :, :, :], context_map2[:, 8:9, :, :])
-
-        coeff2 = torch.cat([coeff_map_1,coeff_map_2,coeff_map_3,coeff_map_4,coeff_map_5,coeff_map_6,coeff_map_7,coeff_map_8,coeff_map_9], dim = 1)
+        coeff2 = self.slicing(grid2, context_map2)
         
         coeff2_split = coeff2.view(coeff2.shape[0], 9, 3, coeff2.shape[2], coeff2.shape[3]).permute(0, 2, 1, 3, 4)   
         out = self.apply_coeff(hidden, coeff2_split)
